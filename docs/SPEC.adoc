@@ -1,0 +1,253 @@
+\= SPEC-1: AI Content Detector
+\:sectnums:
+\:toc:
+
+\== Background
+
+With the rapid rise of AI-generated content, especially through tools like Midjourney, DALL·E, and deepfake technologies, it has become increasingly difficult for average users to distinguish between real and synthetic media. This poses challenges in areas such as misinformation, identity manipulation, and digital trust.
+
+This project aims to create a consumer-facing tool targeted at non-technical users (like older family members) to help them easily verify whether an image or video is likely to be AI-generated. The tool emphasizes simplicity and accessibility over exhaustive forensic accuracy.
+
+\== Requirements
+
+*Must Have*
+
+* Detect whether an uploaded image is likely AI-generated using a simple classification model.
+* Allow users to upload or paste an image or video URL.
+* Simple user interface with very clear results ("Real" vs "AI-generated").
+* Support for JPEG, PNG, and MP4 formats.
+* Mobile-friendly design.
+
+*Should Have*
+
+* Provide a short explanation for the classification result (e.g., "Unusual texture pattern", "No camera noise").
+* Maintain a history/log of checks locally in the browser.
+* Lightweight backend or serverless deployment.
+
+*Could Have*
+
+* Drag-and-drop upload feature.
+* Ability to scan a live webcam feed for AI content (for future extension).
+* Support for batch uploads.
+
+*Won’t Have (for MVP)*
+
+* Highly accurate forensic detection (e.g., deep CNN ensemble models).
+* Cross-platform native apps.
+* Integration with social media APIs.
+
+\== Method
+
+The system is designed as a lightweight cloud-hosted web application consisting of a front-end interface and a back-end AI detection service. The detection model is custom-trained using transfer learning on a dataset of real and AI-generated images.
+
+\=== Architecture Overview
+
+## \[plantuml, architecture, png]
+
+@startuml
+actor User
+User -> WebApp : Upload image
+WebApp -> DetectionAPI : Send image
+DetectionAPI -> ClassifierModel : Analyze
+ClassifierModel -> DetectionAPI : Return result (real/fake)
+DetectionAPI -> WebApp : Return result & explanation
+WebApp -> User : Show result
+@enduml
+-------
+
+\=== Model Architecture
+
+* Model: ResNet50 (pretrained on ImageNet)
+* Fine-tuning dataset:
+
+  * 5,000 real images (ImageNet, Flickr)
+  * 5,000 fake images (from DALL·E, Midjourney, SDXL)
+* Input size: 224x224
+* Loss function: Binary Cross-Entropy
+* Output: Probability of being AI-generated
+
+\=== Deployment Stack
+
+* Frontend: Vite + React + TailwindCSS (or simple HTML/CSS)
+* Backend: FastAPI (Python) with REST endpoint `/detect`
+* ML Model Hosting: AWS EC2 or Render with Docker
+* File storage: Temporarily in-memory or S3 if persistent logging is added
+
+\=== Hybrid Detection Strategy
+
+\==== Image Detection (Custom Model)
+
+Custom-trained ResNet50 classifier to detect AI-generated imagery.
+
+* Dataset: Curated real vs AI-generated images
+* Training method: Transfer learning
+* Hosted on: Cloud backend (Docker + FastAPI)
+
+\==== Video Detection (Pretrained Model)
+
+Pretrained deepfake detection model using public research models:
+
+* Model: DeepFakeDetection (e.g., `deeperforensics`, `DFDC` from Meta or FaceForensics++)
+* Input: Sampled video frames (e.g., 1 per second)
+* Pipeline:
+
+  * Extract frames using FFmpeg
+  * Classify each frame
+  * Aggregate frame scores to give final probability
+* Hosting: Same FastAPI backend or a separate microservice
+
+\==== Media Routing Logic
+
+## \[plantuml, flow, png]
+
+@startuml
+start
+\:User uploads file;
+if (Is it a video?) then (yes)
+\:Use pre-trained deepfake model;
+else (no)
+\:Use custom image model;
+endif
+\:Return classification result;
+stop
+@enduml
+-------
+
+\== Implementation
+
+\=== Step 1: Image Dataset Collection & Model Training
+
+1. **Collect Datasets**:
+
+   * Real images: Download 5,000+ from ImageNet, Flickr.
+   * AI-generated: Scrape/download from Midjourney, DALL·E, SDXL.
+2. **Preprocess**:
+
+   * Resize all images to 224x224.
+   * Normalize using ImageNet mean/std.
+3. **Model Training**:
+
+   * Use PyTorch with ResNet50.
+   * Fine-tune last few layers.
+   * Save best model (`model.pt`) based on validation accuracy.
+
+\=== Step 2: Pretrained Video Detection Integration
+
+1. **Select Model**:
+
+   * Use HuggingFace model: e.g., `jonas/Deepfake-DFDC`.
+2. **Create Frame Sampler**:
+
+   * Use FFmpeg to extract 1 frame/sec.
+   * Pass each frame through the model.
+3. **Score Aggregation**:
+
+   * Average frame probabilities for final result.
+
+\=== Step 3: Backend Setup
+
+1. **FastAPI** endpoints:
+
+   * `/detect-image`: Accept image upload, run custom model.
+   * `/detect-video`: Accept video upload/URL, extract & analyze frames.
+2. **Model Loader**:
+
+   * Load PyTorch model for image, load pretrained HuggingFace pipeline for video.
+3. **Deploy**:
+
+   * Containerize using Docker.
+   * Deploy to Render/AWS EC2.
+
+\=== Step 4: Frontend Development
+
+1. **Tech Stack**:
+
+   * Vite + React + TailwindCSS.
+2. **Pages**:
+
+   * Home: Upload media or paste URL.
+   * Results: Show classification, probability, and short explanation.
+3. **UX**:
+
+   * Display upload progress.
+   * Friendly labels (“Real”, “Possibly AI-generated”).
+
+\=== Step 5: Deployment
+
+* Backend: Dockerized FastAPI on Render or AWS EC2.
+* Frontend: Vercel or Netlify.
+* CI/CD: GitHub Actions (optional for deployment automation).
+
+\== Milestones
+
+*Week 1–2: Dataset & Research*
+
+* Collect and label 10,000 images (real vs AI-generated)
+* Research and test pretrained video detection models
+* Set up development environment and repos
+
+*Week 3–4: Image Model Training*
+
+* Preprocess dataset
+* Train and evaluate ResNet50 model
+* Save/export the best-performing checkpoint
+
+*Week 5: Backend Development*
+
+* Build FastAPI service with `/detect-image` and `/detect-video`
+* Integrate PyTorch model and pretrained deepfake detector
+* Implement FFmpeg-based video frame extractor
+
+*Week 6: Frontend Development*
+
+* Build upload interface and results page using Vite + TailwindCSS
+* Connect frontend to backend via REST APIs
+* Test end-to-end upload -> detect -> result flow
+
+*Week 7: Testing and Tuning*
+
+* Unit + integration testing of detection API
+* Tune frontend for usability (especially for older users)
+* Add simple explanations for results
+
+*Week 8: Deployment & Wrap-Up*
+
+* Deploy backend and frontend to cloud platforms
+* Perform final tests on mobile and desktop
+* Document usage steps and limitations
+
+\== Gathering Results
+
+To evaluate the success of the AI content detection tool, the following methods will be used:
+
+\=== Functional Validation
+
+* Upload a diverse set of known real and AI-generated media to verify consistent and accurate classification.
+* Manually inspect results for edge cases (e.g., images with distortions, low-res video).
+* Confirm that both image and video detection paths work as expected via backend logs and frontend feedback.
+
+\=== Usability Testing
+
+* Conduct informal user testing with target audience (parents, grandparents).
+* Collect feedback on:
+
+  * Clarity of results
+  * Ease of upload
+  * Overall confidence in the detection system
+* Iterate on interface design based on confusion points or unclear feedback.
+
+\=== Performance Metrics
+
+* Track:
+
+  * Accuracy of image detection model on a 20% held-out test set
+  * Video detection average confidence vs ground truth (on a labeled sample set)
+  * Average API response time for image and video uploads
+
+\=== Post-launch Improvements
+
+* Based on logs and user feedback, improve:
+
+  * Model accuracy via dataset expansion
+  * UI/UX refinements for clarity
+  * Performance optimizations (e.g., async frame extraction, better loading indicators)

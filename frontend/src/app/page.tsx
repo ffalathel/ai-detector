@@ -69,11 +69,10 @@ export default function Home() {
           {/* Header */}
           <div className="text-center mb-12">
             <h1 className="text-4xl md:text-5xl font-bold text-gray-800 mb-4">
-              🧠✨ AI Content Detector
+              AI Content Detector
             </h1>
             <p className="text-lg text-gray-600 max-w-2xl mx-auto">
               A simple, friendly tool to help you figure out if an image or video is AI-generated. 
-              Perfect for everyone - no tech knowledge required!
             </p>
           </div>
 

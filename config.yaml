@@ -1,0 +1,47 @@
+# Configuration for Deepfake Detection Training
+
+# Model Configuration
+backbone: 'resnet50'  # Options: resnet50, efficientnet_b0, efficientnet_b3
+pretrained: true
+dropout: 0.5
+num_classes: 2
+
+# Training Configuration
+batch_size: 32
+learning_rate: 0.0001
+weight_decay: 0.0001
+epochs: 100
+warmup_epochs: 5
+
+# Data Configuration
+train_ratio: 0.7
+val_ratio: 0.15
+num_workers: 4
+pin_memory: true
+
+# Regularization
+patience: 15
+min_delta: 0.0001
+grad_clip_value: 1.0
+
+# Paths
+data_path: "data"
+output_dir: "models"
+log_dir: "logs"
+
+# Monitoring (set to false if you don't have these services set up)
+use_wandb: false  # Set to true if you have wandb account
+use_tensorboard: true
+use_mlflow: false  # Set to true if you have mlflow set up
+
+# Model Ensemble
+use_ensemble: false
+ensemble_models:
+  - 'resnet50'
+  - 'efficientnet_b0'
+  - 'efficientnet_b3'
+
+# Production
+model_version: "1.0.0"
+api_host: "0.0.0.0"
+api_port: 8000

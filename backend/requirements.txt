@@ -1,0 +1,25 @@
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.21.0
+pandas>=1.3.0
+scikit-learn>=1.0.0
+Pillow>=8.3.0
+opencv-python>=4.5.0
+tqdm>=4.62.0
+pyyaml>=6.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# Optional monitoring (uncomment if needed)
+# tensorboard>=2.8.0
+# wandb>=0.12.0
+# mlflow>=1.20.0
+
+# For API serving
+fastapi>=0.68.0
+uvicorn>=0.15.0
+python-multipart>=0.0.5
+psutil>=5.8.0
+
+# For face detection (optional)
+# facenet-pytorch>=2.5.0

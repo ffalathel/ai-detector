@@ -97,6 +97,11 @@ image_model: Optional[ImprovedDeepfakeDetector] = None
 video_model = None  # Extend loading when video model ready
 device: Optional[torch.device] = None
 
+# Check training mode at startup
+TRAINING_MODE = os.getenv("TRAINING_MODE") == "true"
+if TRAINING_MODE:
+    logger.info("Training mode detected - API will run in training mode")
+
 # Image preprocessing pipeline
 image_transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -109,6 +114,14 @@ image_transform = transforms.Compose([
 @app.on_event("startup")
 async def startup_event():
     global image_model, video_model, device
+
+    # Skip model loading if training mode is detected
+    if os.getenv("TRAINING_MODE") == "true":
+        logger.info("Training mode detected - skipping model loading to avoid conflicts")
+        device = None
+        image_model = None
+        video_model = None
+        return
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Starting up. Using device: {device}")
@@ -134,6 +147,25 @@ async def startup_event():
 # -------------------- Health Check Endpoint --------------------
 @app.get("/health")
 async def health_check():
+    training_mode = os.getenv("TRAINING_MODE") == "true"
+    
+    if training_mode:
+        return {
+            "status": "training_mode",
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "message": "Service in training mode - models not loaded",
+            "models": {
+                "image_model": "not_loaded",
+                "video_model": "not_loaded"
+            },
+            "device": "unknown",
+            "system": {
+                "cuda_available": torch.cuda.is_available(),
+                "cuda_devices": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+                "training_mode": True
+            }
+        }
+    
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -144,13 +176,28 @@ async def health_check():
         "device": str(device) if device else "unknown",
         "system": {
             "cuda_available": torch.cuda.is_available(),
-            "cuda_devices": torch.cuda.device_count() if torch.cuda.is_available() else 0
+            "cuda_devices": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+            "training_mode": False
         }
     }
 
 # -------------------- Root Endpoint --------------------
 @app.get("/")
 async def root():
+    training_mode = os.getenv("TRAINING_MODE") == "true"
+    
+    if training_mode:
+        return {
+            "message": "AI Content Detector API (Training Mode)",
+            "version": "1.0.0",
+            "status": "training_mode",
+            "note": "Service temporarily unavailable during training",
+            "endpoints": {
+                "health": "/health",
+                "docs": "/docs"
+            }
+        }
+    
     return {
         "message": "AI Content Detector API",
         "version": "1.0.0",
@@ -168,6 +215,10 @@ async def root():
 async def analyze_image(file: UploadFile = File(...)):
     start_time = time.time()
 
+    # Check if we're in training mode
+    if os.getenv("TRAINING_MODE") == "true":
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable during training")
+
     # Validate file async-safe by offloading to threadpool
     validation_result = await run_in_threadpool(validate_file, file, "image")
     if not validation_result["valid"]:
@@ -183,6 +234,10 @@ async def analyze_image(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image format: {str(e)}")
 
+    # Lazy load model if not already loaded
+    if image_model is None:
+        await load_model_if_needed()
+    
     if image_model is None:
         logger.warning("Image model not loaded; returning mock response.")
         prediction, confidence = "ai_generated" if "ai" in file.filename.lower() else "real", 0.75
@@ -213,6 +268,10 @@ async def analyze_image(file: UploadFile = File(...)):
 async def analyze_video(file: UploadFile = File(...)):
     start_time = time.time()
     tmp_path = None
+
+    # Check if we're in training mode
+    if os.getenv("TRAINING_MODE") == "true":
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable during training")
 
     validation_result = await run_in_threadpool(validate_file, file, "video")
     if not validation_result["valid"]:
@@ -265,6 +324,27 @@ async def analyze_video(file: UploadFile = File(...)):
     return response
 
 # -------------------- Helper Functions --------------------
+async def load_model_if_needed():
+    """Lazy load model when first needed"""
+    global image_model, device
+    
+    if image_model is not None:
+        return
+        
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Initializing device: {device}")
+    
+    try:
+        image_model = load_image_model("models/image_model.pt", device)
+        if image_model is None:
+            logger.warning("Image model not loaded or missing.")
+        else:
+            logger.info("Image model loaded successfully on demand.")
+    except Exception as e:
+        logger.error(f"Failed to load image model: {e}")
+        image_model = None
+
 def predict_image(image: Image.Image, model, device) -> tuple:
     model.eval()
     input_tensor = image_transform(image).unsqueeze(0).to(device)
@@ -278,15 +358,16 @@ def predict_image(image: Image.Image, model, device) -> tuple:
 
 def process_video_file(video_path: str) -> tuple:
     """Placeholder video processing - replace with Microsoft model later"""
+    cap = None
     try:
         cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError("Failed to open video file")
         
         # Get basic video info
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         duration = total_frames / fps if fps > 0 else 0
-        
-        cap.release()
         
         # Placeholder logic - replace this with Microsoft model
         # For now, random prediction based on filename hints
@@ -316,6 +397,10 @@ def process_video_file(video_path: str) -> tuple:
         logger.error(f"Video processing error: {e}")
         # Fallback
         return "real", 0.5, {"frames_analyzed": 0, "duration": 0}
+    finally:
+        # Ensure cap is always released
+        if cap is not None:
+            cap.release()
 
 def get_detected_features(prediction: str, confidence: float, media_type: str) -> list:
     # [Keep your existing get_detected_features function logic here]

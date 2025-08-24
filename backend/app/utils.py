@@ -170,31 +170,32 @@ def process_video(video_content: bytes) -> Dict[str, Any]:
     Raises:
         ValueError if video cannot be opened or is too short.
     """
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    temp_path = temp_file.name
+    temp_file = None
+    temp_path = None
+    cap = None
+    
     try:
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        temp_path = temp_file.name
         temp_file.write(video_content)
         temp_file.close()
+        temp_file = None  # Clear reference
 
         cap = cv2.VideoCapture(temp_path)
         if not cap.isOpened():
             raise ValueError("Failed to open video file")
 
-        try:
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            duration = total_frames / fps if fps > 0 else 0
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        duration = total_frames / fps if fps > 0 else 0
 
-            if duration < 0.5:
-                raise ValueError("Video too short (minimum 0.5 seconds)")
+        if duration < 0.5:
+            raise ValueError("Video too short (minimum 0.5 seconds)")
 
-            if duration > 300:
-                logger.warning("Long video detected (>5 minutes), processing may take time")
-
-        finally:
-            cap.release()
+        if duration > 300:
+            logger.warning("Long video detected (>5 minutes), processing may take time")
 
         return {
             "fps": fps,
@@ -207,9 +208,13 @@ def process_video(video_content: bytes) -> Dict[str, Any]:
 
     except Exception as e:
         logger.error(f"Video processing error: {e}")
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
         raise ValueError(f"Failed to process video: {str(e)}")
+    finally:
+        # Ensure resources are properly cleaned up
+        if cap is not None:
+            cap.release()
+        if temp_file is not None:
+            temp_file.close()
 
 def extract_video_frames(video_path: str, max_frames: int = 50) -> List[np.ndarray]:
     """
@@ -249,6 +254,7 @@ def extract_video_frames(video_path: str, max_frames: int = 50) -> List[np.ndarr
     finally:
         if cap is not None:
             cap.release()
+            cap = None  # Clear reference
 
     return frames
 

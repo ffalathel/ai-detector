@@ -9,7 +9,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from torchvision import datasets, transforms, models
 import torch.nn.functional as F
-
+import tempfile
+from PIL import Image
 import os
 import sys
 import yaml
@@ -26,6 +27,7 @@ from collections import Counter
 import random
 import time
 import warnings
+import wandb
 warnings.filterwarnings('ignore')
 
 # Import utilities
@@ -53,7 +55,6 @@ from tqdm import tqdm
 
 # Optional MLOps and Monitoring (with fallbacks)
 try:
-    import wandb
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
@@ -82,18 +83,9 @@ except ImportError:
     PLOTTING_AVAILABLE = False
     print("Warning: matplotlib/seaborn not available. Plotting disabled.")
 
-# Model Serving and API (optional)
-try:
-    from fastapi import FastAPI, File, UploadFile, HTTPException
-    from fastapi.middleware.cors import CORSMiddleware
-    import uvicorn
-    from PIL import Image
-    import io
-    import base64
-    FASTAPI_AVAILABLE = True
-except ImportError:
-    FASTAPI_AVAILABLE = False
-    print("Warning: FastAPI not available. Model serving disabled.")
+# Model Serving and API (optional) - DISABLED to prevent conflicts
+FASTAPI_AVAILABLE = False
+print("Warning: FastAPI serving disabled in training mode to prevent conflicts with main app")
 
 # Configuration Management
 @dataclass
@@ -145,6 +137,11 @@ class TrainingConfig:
     IMAGENET_MEAN: List[float] = None
     IMAGENET_STD: List[float] = None
 
+    
+    resume: bool = False                # whether to resume at all
+    resume_from: Optional[str] = None   # path to checkpoint (if None, pick default)
+    resume_best: bool = True 
+    use_mixed_precision: bool = True
     def __post_init__(self):
         if self.ensemble_models is None:
             self.ensemble_models = ['resnet50', 'efficientnet_b0', 'efficientnet_b3']
@@ -154,6 +151,8 @@ class TrainingConfig:
             self.IMAGENET_MEAN = [0.485, 0.456, 0.406]
         if self.IMAGENET_STD is None:
             self.IMAGENET_STD = [0.229, 0.224, 0.225]
+    
+     
 
 # Enhanced Logging Setup
 def setup_logging(config: TrainingConfig) -> logging.Logger:
@@ -204,6 +203,52 @@ class ReproducibilityManager:
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
 
+def extract_labels_from_dataloader(loader: DataLoader) -> List[int]:
+    """
+    Robustly extract labels from a DataLoader's underlying dataset.
+    Falls back to iterating the base dataset if necessary (costly).
+    """
+    dataset = loader.dataset
+    # Unwrap Subset -> dataset.dataset
+    try:
+        # If it's a Subset, get the underlying dataset and indices
+        if hasattr(dataset, "dataset") and hasattr(dataset, "indices"):
+            base = dataset.dataset
+            indices = dataset.indices
+            # prefer base.targets or base.labels if available
+            targets = getattr(base, "targets", None) or getattr(base, "labels", None)
+            if targets is not None:
+                # handle torch tensors or lists
+                return [int(targets[i]) for i in indices]
+            # fallback: iterate through subset
+            labels = []
+            for i in indices:
+                item = base[i]
+                # item can be (x, y) or dict
+                if isinstance(item, (tuple, list)):
+                    labels.append(int(item[1]))
+                elif isinstance(item, dict) and "label" in item:
+                    labels.append(int(item["label"]))
+                else:
+                    raise ValueError("Cannot extract label from dataset item.")
+            return labels
+        else:
+            base = getattr(dataset, "dataset", dataset)
+            targets = getattr(base, "targets", None) or getattr(base, "labels", None)
+            if targets is not None:
+                return [int(t) for t in targets]
+            # Final fallback: iterate (may be slow)
+            labels = []
+            for _, y in base:
+                labels.append(int(y))
+            return labels
+    except Exception as e:
+        logging.getLogger(f"Failed to extract labels robustly: {e}. Falling back to iteration.")
+        labels = []
+        for _, y in loader.dataset:
+            labels.append(int(y))
+        return labels
+    
 # Advanced Data Pipeline
 class DataPipeline:
     def __init__(self, config: TrainingConfig):
@@ -251,78 +296,152 @@ class DataPipeline:
         if not os.path.exists(self.config.data_path):
             raise FileNotFoundError(f"Data path does not exist: {self.config.data_path}")
         
-        full_dataset = datasets.ImageFolder(root=self.config.data_path)
+        # Create base dataset WITHOUT transforms
+        base_dataset = datasets.ImageFolder(root=self.config.data_path, transform=None)
         
-        if len(full_dataset) == 0:
+        if len(base_dataset) == 0:
             raise ValueError(f"No images found in {self.config.data_path}")
+        class_counts = Counter([label for _, label in base_dataset.samples])
+        if len(class_counts) < 2:
+            raise ValueError(f"Dataset must contain at least 2 classes, found: {list(class_counts.keys())}")
+    
+        if min(class_counts.values()) < 10:  # Minimum samples per class
+            raise ValueError(f"Each class must have at least 10 samples. Current distribution: {dict(class_counts)}")
         
+        valid_samples = []
+        corrupted_count = 0
+        for img_path, label in base_dataset.samples:
+            try:
+            # Test if image can be opened and converted
+                with Image.open(img_path) as img:
+                    img.verify()  # Verify image integrity
+                
+                # Test conversion to RGB
+                with Image.open(img_path) as img:
+                    img.convert('RGB')
+                
+                valid_samples.append((img_path, label))
+            except Exception as e:
+                corrupted_count += 1
+                if corrupted_count <= 10:  # Log first 10 corrupted images
+                    logging.getLogger(__name__).warning(f"Corrupted image {img_path}: {e}")
+                elif corrupted_count == 11:
+                    logging.getLogger(__name__).warning("Additional corrupted images will not be logged individually")
+    
+        if corrupted_count > 0:
+            logging.getLogger(__name__).warning(f"Found {corrupted_count} corrupted images out of {len(base_dataset.samples)} total")
+        
+        if len(valid_samples) < 20:  # Minimum total valid samples
+            raise ValueError(f"Too many corrupted images. Only {len(valid_samples)} valid images found.")
+    
+        base_dataset.samples = valid_samples
+        base_dataset.targets = [label for _, label in valid_samples]
+
         # Stratified split
-        train_indices, val_indices, test_indices = self._stratified_split(full_dataset)
+        train_indices, val_indices, test_indices = self._stratified_split(base_dataset)
         
-        # Create datasets
-        train_dataset = Subset(full_dataset, train_indices)
-        val_dataset = Subset(full_dataset, val_indices)
-        test_dataset = Subset(full_dataset, test_indices)
+        # Create custom dataset class to handle transforms properly
+        class TransformDataset(torch.utils.data.Dataset):
+            def __init__(self, base_dataset, indices, transform):
+                self.base_dataset = base_dataset
+                self.indices = indices
+                self.transform = transform
+                self.samples = [self.base_dataset.samples[i] for i in indices]
+            
+            def __getitem__(self, idx):
+                img_path, label = self.base_dataset.samples[self.indices[idx]]
+                try:
+                    img = Image.open(img_path).convert('RGB')
+                except Exception as e:
+                    logging.getLogger(__name__).error(f"Error loading image {img_path}: {e}")
+                    # Return a blank image as fallback
+                    img = Image.new('RGB', (224, 224), (0, 0, 0))
         
-        # Apply transforms
-        train_dataset.dataset.transform = self.train_transform
-        val_dataset.dataset.transform = self.val_transform
-        test_dataset.dataset.transform = self.val_transform
+                if self.transform:
+                    img = self.transform(img)
+                return img, label
+            
+            def __len__(self):
+                return len(self.indices)
+        
+        # Create properly isolated datasets
+        train_dataset = TransformDataset(base_dataset, train_indices, self.train_transform)
+        val_dataset = TransformDataset(base_dataset, val_indices, self.val_transform)
+        test_dataset = TransformDataset(base_dataset, test_indices, self.val_transform)
         
         # Weighted sampling for imbalanced data
-        train_sampler = self._create_weighted_sampler(full_dataset, train_indices)
+        train_sampler = self._create_weighted_sampler(base_dataset, train_indices)
         
         # Create data loaders
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.config.batch_size,
             sampler=train_sampler,
-            num_workers=self.config.num_workers,
-            pin_memory=self.config.pin_memory,
-            persistent_workers= False
+            shuffle=False,  # EXPLICIT: Required when using custom sampler
+            num_workers=min(self.config.num_workers, 4),  # Limit workers
+            pin_memory=self.config.pin_memory and torch.cuda.is_available(),
+            persistent_workers= False,  
+            drop_last=True  # Prevent batch size inconsistencies
         )
         
         val_loader = DataLoader(
             val_dataset,
             batch_size=self.config.batch_size,
             shuffle=False,
-            num_workers=self.config.num_workers,
-            pin_memory=self.config.pin_memory
+            num_workers=min(self.config.num_workers, 4),
+            pin_memory=self.config.pin_memory and torch.cuda.is_available(),
+            persistent_workers=self.config.num_workers > 0
         )
         
         test_loader = DataLoader(
             test_dataset,
             batch_size=self.config.batch_size,
             shuffle=False,
-            num_workers=self.config.num_workers,
-            pin_memory=self.config.pin_memory
+            num_workers=min(self.config.num_workers, 4),
+            pin_memory=self.config.pin_memory and torch.cuda.is_available(),
+            persistent_workers=self.config.num_workers > 0
         )
-        
-        return train_loader, val_loader, test_loader, full_dataset.classes
     
-    def _stratified_split(self, dataset, train_ratio=None, val_ratio=None):
-        """Create stratified train/val/test split"""
+        return train_loader, val_loader, test_loader, base_dataset.classes
+    
+    def _stratified_split(self, dataset, train_ratio=None, val_ratio=None, seed = 42):
+        """Create stratified train/val/test split with proper seeding"""
+        if seed is None:
+            seed = getattr(self.config, "seed", 42)
         if train_ratio is None:
             train_ratio = self.config.train_ratio
         if val_ratio is None:
             val_ratio = self.config.val_ratio
             
+        # Use dataset samples for labels
         labels = [label for _, label in dataset.samples]
         class_indices = {}
         for idx, label in enumerate(labels):
             class_indices.setdefault(label, []).append(idx)
         
+        # FIXED: Use numpy for reproducible shuffling
+        np.random.seed(seed)
         train_indices, val_indices, test_indices = [], [], []
+        
         for indices in class_indices.values():
-            random.shuffle(indices)
+            indices = np.array(indices)
+            np.random.shuffle(indices)  # Seeded shuffle
             n_train = int(len(indices) * train_ratio)
             n_val = int(len(indices) * val_ratio)
             
-            train_indices.extend(indices[:n_train])
-            val_indices.extend(indices[n_train:n_train+n_val])
-            test_indices.extend(indices[n_train+n_val:])
+            train_indices.extend(indices[:n_train].tolist())
+            val_indices.extend(indices[n_train:n_train+n_val].tolist())
+            test_indices.extend(indices[n_train+n_val:].tolist())
+        
+        # Final shuffle of the combined indices (also seeded)
+        np.random.shuffle(train_indices)
+        np.random.shuffle(val_indices)
+        np.random.shuffle(test_indices)
+
+        rng = np.random.default_rng(seed)
         
         return train_indices, val_indices, test_indices
+
     
     def _create_weighted_sampler(self, dataset, indices):
         """Create weighted sampler for imbalanced datasets"""
@@ -437,7 +556,7 @@ class TrainingManager:
         self.config = config
         self.logger = logger
         self.device = get_device()
-        set_seed(42)
+        
         
         # Initialize monitoring
         self.setup_monitoring()
@@ -447,7 +566,8 @@ class TrainingManager:
         self.optimizer = None
         self.scheduler = None
         self.criterion = None
-        self.scaler = torch.cuda.amp.GradScaler()
+        self.use_amp = torch.cuda.is_available() and getattr(self.config, 'use_mixed_precision', True)
+        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
         
         # Training state
         self.current_epoch = 0
@@ -493,10 +613,25 @@ class TrainingManager:
         # Model
         self.model = ProductionDeepfakeDetector(self.config).to(self.device)
         
-        # Loss function with class weights
-        pos_weight = class_weights[0] / class_weights[1] if len(class_weights) > 1 else None
-        self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        if num_classes == 2:
+            # For binary classification with BCEWithLogitsLoss
+            # pos_weight should be the ratio of negative to positive samples
+            n_neg = float(class_weights[0])
+            n_pos = float(class_weights[1])
         
+            if n_pos <= 0:
+                self.logger.warning("No positive samples in the training set; using pos_weight=1.0")
+                pos_weight = torch.tensor(1.0, device=self.device)
+            elif n_neg <= 0:
+                self.logger.warning("No negative samples in the training set; using pos_weight=1.0")
+                pos_weight = torch.tensor(1.0, device=self.device)
+            else:
+                pos_weight = torch.tensor(n_neg / n_pos, device=self.device)
+        else:
+            pos_weight = torch.tensor(1.0, device=self.device)
+
+        self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
         # Optimizer with different learning rates
         backbone_params = []
         classifier_params = []
@@ -520,9 +655,10 @@ class TrainingManager:
         self.warmup_scheduler = WarmupScheduler(
             self.optimizer, self.config.warmup_epochs, self.config.learning_rate
         )
+
     
     def train_epoch(self, train_loader):
-        train_loss, train_metrics = train_one_epoch(
+        train_loss, train_metrics, _, _, _  = train_one_epoch(
             model=self.model,
             dataloader=train_loader,
             optimizer=self.optimizer,
@@ -544,7 +680,7 @@ class TrainingManager:
         )
         return val_loss, metrics, labels, preds, scores
     
-    def save_checkpoint(self, metrics: Dict, is_best: bool = False):
+    def save_checkpoint(self, metrics: Dict, is_best: bool = False):    
         save_checkpoint(
             model=self.model,
             optimizer=self.optimizer,
@@ -556,6 +692,39 @@ class TrainingManager:
             is_best=is_best,
             logger=self.logger
         )
+    def resume_training(self):
+        """Resume training from a saved checkpoint if config.resume is set."""
+        if not self.config.resume:
+            return  # nothing to do
+
+        checkpoint_path = Path(self.config.resume_from) if self.config.resume_from \
+            else Path(self.config.output_dir) / "best_model.pt"
+
+        if not checkpoint_path.exists():
+            if self.logger:
+                self.logger.warning(f"No checkpoint found at {checkpoint_path}, starting fresh.")
+            return
+        try:
+            last_epoch, last_metrics = load_checkpoint(
+                checkpoint_path=checkpoint_path,
+                model=self.model,
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                scaler=self.scaler,
+                logger=self.logger,
+                map_location="cuda" if torch.cuda.is_available() else "cpu"
+            )
+
+            self.current_epoch = last_epoch + 1
+            if last_metrics:
+                self.best_metrics = last_metrics
+
+            if self.logger:
+                self.logger.info(f"Resuming training from epoch {self.current_epoch}")
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Failed to resume training: {e}")
+        
     
     def log_metrics(self, train_loss, train_acc, val_loss, val_metrics):
         try:
@@ -622,80 +791,17 @@ class TrainingManager:
         except Exception as e:
             self.logger.error(f"Error ending MLflow run: {e}")
 
-# FastAPI Model Serving
+# FastAPI Model Serving - DISABLED to prevent conflicts with main app
+# Use the main FastAPI app in app/main.py instead
 class ModelServer:
     def __init__(self, model_path: str, config: TrainingConfig):
-        self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Initialize logger
-        self.logger = logging.getLogger('model_server')
-        self.logger.setLevel(logging.INFO)
-        if not self.logger.handlers:
-            handler = logging.StreamHandler()
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            handler.setFormatter(formatter)
-            self.logger.addHandler(handler)
-        
-        # Load model
-        self.model = ProductionDeepfakeDetector(config).to(self.device)
-        checkpoint = torch.load(model_path, map_location=self.device, weights_only=True)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.model.eval()
-        
-        # Transforms
-        self.transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        
-        # Initialize FastAPI
-        if FASTAPI_AVAILABLE:
-            self.app = FastAPI(title="Deepfake Detection API", version=config.model_version)
-            self.setup_routes()
-        else:
-            raise ImportError("FastAPI not available. Install with: pip install fastapi uvicorn")
+        raise NotImplementedError("ModelServer disabled. Use the main FastAPI app in app/main.py for serving")
     
     def setup_routes(self):
-        @self.app.get("/health")
-        async def health_check():
-            return {"status": "healthy", "model_version": self.config.model_version}
-        
-        @self.app.post("/predict")
-        async def predict(file: UploadFile = File(...)):
-            try:
-                self.logger.info(f"Received file: {file.filename}, content_type: {file.content_type}")
-
-                if not file.content_type.startswith('image/'):
-                    self.logger.warning(f"Rejected non-image file: {file.content_type}")
-                    raise HTTPException(status_code=400, detail="File must be an image")
-
-                image_bytes = await file.read()
-                image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-                image_tensor = self.transform(image).unsqueeze(0).to(self.device)
-
-                with torch.no_grad():
-                    logits = self.model(image_tensor)
-                    probability = torch.sigmoid(logits).item()
-
-                is_fake = probability > 0.5
-                confidence = probability if is_fake else 1 - probability
-
-                self.logger.info(f"Prediction: {'fake' if is_fake else 'real'}, confidence: {confidence:.4f}")
-
-                return {
-                    "prediction": "fake" if is_fake else "real",
-                    "confidence": float(confidence),
-                    "probability": float(probability),
-                    "model_version": self.config.model_version
-                }
-            except Exception as e:
-                self.logger.error(f"Prediction error: {e}", exc_info=True)
-                raise HTTPException(status_code=500, detail="Internal server error")
+        pass
     
     def start_server(self):
-        uvicorn.run(self.app, host=self.config.api_host, port=self.config.api_port)
+        pass
 
 def generate_evaluation_report(y_true, y_pred, y_scores, class_names, config, history):
     """Generate comprehensive evaluation report with plots and JSON output"""
@@ -834,8 +940,7 @@ def save_production_model(model, config, metrics):
 def main():
     parser = argparse.ArgumentParser(description='Production Deepfake Detection Training')
     parser.add_argument('--config', type=str, default='config.yaml', help='Config file path')
-    parser.add_argument('--serve', action='store_true', help='Start model server')
-    parser.add_argument('--model_path', type=str, help='Model path for serving')
+    # Server mode disabled to prevent conflicts with main FastAPI app
     args = parser.parse_args()
     
     # Load configuration
@@ -860,42 +965,76 @@ def main():
         except Exception as e:
             print(f"Failed to save default config: {e}")
     
-    # Model serving mode
-    if args.serve:
-        if not args.model_path:
-            raise ValueError("Model path required for serving mode")
-        if not FASTAPI_AVAILABLE:
-            raise ImportError("FastAPI not available. Install with: pip install fastapi uvicorn python-multipart pillow")
-        server = ModelServer(args.model_path, config)
-        server.start_server()
-        return
+    # Set seed for reproducibility
+    set_seed(getattr(config, "seed", 42))
     
-    # Setup reproducibility
-    ReproducibilityManager.set_seed(42)
+    # Validate configuration
+    from utils import validate_config, log_system_info
+    if not validate_config(config):
+        raise ValueError("Configuration validation failed")
+    
+    # Log system information
+    log_system_info()
+    
+    # Model serving mode - DISABLED to prevent conflicts with main app
+    if args.serve:
+        raise NotImplementedError("Server mode disabled. Use the main FastAPI app in app/main.py for serving")
     
     # Setup logging
     logger = setup_logging(config)
     logger.info(f"Starting training with config: {config}")
     
+    # Initialize trainer variable for cleanup
+    trainer = None
+    
     try:
         # Create data pipeline
+        logger.info("Setting up data pipeline...")
         data_pipeline = DataPipeline(config)
         train_loader, val_loader, test_loader, class_names = data_pipeline.create_datasets()
         
         logger.info(f"Dataset: {len(train_loader.dataset)} train, {len(val_loader.dataset)} val, {len(test_loader.dataset)} test")
         logger.info(f"Classes: {class_names}")
         
-        # Calculate class weights
-        train_labels = [train_loader.dataset.dataset.samples[i][1] for i in train_loader.dataset.indices]
-        class_counts = Counter(train_labels)
-        class_weights = torch.tensor([class_counts[i] for i in range(len(class_names))], dtype=torch.float)
+        # Calculate class weights using the fixed extraction method
+        def extract_labels_from_dataset(dataset):
+            """Extract labels from any dataset type"""
+            if hasattr(dataset, 'indices') and hasattr(dataset, 'base_dataset'):
+                # Custom TransformDataset
+                return [dataset.base_dataset.samples[i][1] for i in dataset.indices]
+            elif hasattr(dataset, 'samples'):
+                # ImageFolder
+                return [label for _, label in dataset.samples]
+            elif hasattr(dataset, 'targets'):
+                # Generic dataset with targets
+                return list(dataset.targets)
+            else:
+                # Fallback: iterate through dataset
+                labels = []
+                for _, label in dataset:
+                    labels.append(label)
+                return labels
+        
+        labels = extract_labels_from_dataset(train_loader.dataset)
+        class_counts = Counter(labels)
+        # Guarantee both classes exist in the vector (even if count is 0)
+        counts_vector = [class_counts.get(i, 0) for i in range(len(class_names))]
+        class_weights = torch.tensor(counts_vector, dtype=torch.float)
+        
+        logger.info(f"Class distribution: {dict(class_counts)}")
+        logger.info(f"Class weights: {class_weights.tolist()}")
         
         # Initialize training manager
+        logger.info("Initializing training manager...")
         trainer = TrainingManager(config, logger)
         trainer.setup_model_and_training(len(class_names), class_weights)
         
         logger.info(f"Model initialized: {sum(p.numel() for p in trainer.model.parameters())} parameters")
         logger.info(f"Training on device: {trainer.device}")
+        
+        # Resume training if requested
+        logger.info("Checking for resume training...")
+        trainer.resume_training()
         
         # Early stopping
         early_stopping = EarlyStopping(
@@ -904,80 +1043,156 @@ def main():
             metric='f1'
         )
         
-        # Training loop
-        logger.info("Starting training...")
+        # Training variables
         best_f1 = 0.0
+        start_epoch = trainer.current_epoch
         
-        for epoch in range(config.epochs):
+        # Training loop
+        logger.info(f"Starting training from epoch {start_epoch}...")
+        
+        for epoch in range(start_epoch, config.epochs):
             trainer.current_epoch = epoch
             
-            # Training
-            train_loss, train_acc = trainer.train_epoch(train_loader)
-            
-            # Validation
-            val_loss, val_metrics, val_labels, val_preds, val_scores = trainer.validate(val_loader)
-            
-            # Update history
-            trainer.training_history['train_loss'].append(train_loss)
-            trainer.training_history['val_loss'].append(val_loss)
-            trainer.training_history['train_acc'].append(train_acc)
-            trainer.training_history['val_acc'].append(val_metrics['accuracy'])
-            trainer.training_history['learning_rates'].append(trainer.optimizer.param_groups[0]['lr'])
-            trainer.training_history['val_f1'].append(val_metrics['f1'])
-            trainer.training_history['val_auc'].append(val_metrics['auc'])
-            
-            # Scheduler step
-            if epoch >= config.warmup_epochs:
-                trainer.scheduler.step()
-            
-            # Logging
-            trainer.log_metrics(train_loss, train_acc, val_loss, val_metrics)
-            
-            # Checkpoint saving
-            is_best = val_metrics['f1'] > best_f1
-            if is_best:
-                best_f1 = val_metrics['f1']
-                trainer.best_metrics = val_metrics
-                logger.info(f"New best model saved! F1: {val_metrics['f1']:.4f}, AUC: {val_metrics['auc']:.4f}")
-            
-            trainer.save_checkpoint(val_metrics, is_best)
-            
-            # Early stopping
-            if early_stopping(val_metrics, trainer.model):
-                logger.info(f"Early stopping triggered at epoch {epoch+1}")
-                early_stopping.load_best_weights(trainer.model)
-                break
+            try:
+                logger.info(f"Starting epoch {epoch + 1}/{config.epochs}")
+                
+                # Training phase
+                train_loss, train_metrics, _, _, _ = trainer.train_epoch(train_loader)
+                
+                # Validation phase
+                val_loss, val_metrics, _, _,_ = trainer.validate(val_loader)
+                
+                # Update training history
+                trainer.training_history['train_loss'].append(train_loss)
+                trainer.training_history['val_loss'].append(val_loss)
+                trainer.training_history['train_acc'].append(train_metrics['accuracy'])
+                trainer.training_history['val_acc'].append(val_metrics['accuracy'])
+                trainer.training_history['learning_rates'].append(trainer.optimizer.param_groups[0]['lr'])
+                trainer.training_history['val_f1'].append(val_metrics['f1'])
+                trainer.training_history['val_auc'].append(val_metrics['auc'])
+                
+                # Learning rate scheduling (only after warmup)
+                if epoch >= config.warmup_epochs:
+                    trainer.scheduler.step()
+                
+                # Logging metrics
+                trainer.log_metrics(train_loss, train_metrics['accuracy'], val_loss, val_metrics)
+                
+                # Checkpoint saving
+                is_best = val_metrics['f1'] > best_f1
+                if is_best:
+                    best_f1 = val_metrics['f1']
+                    trainer.best_metrics = val_metrics.copy()
+                    logger.info(f"New best model! F1: {val_metrics['f1']:.4f}, AUC: {val_metrics['auc']:.4f}")
+                if (epoch + 1) % 5 == 0:
+                    periodic_metrics = {
+                        "epoch": epoch,
+                        "periodic": True,
+                        "train_loss": train_loss,
+                        "val_loss": val_loss,
+                        "val_f1": val_metrics.get('f1', 0)
+                    }
+                    trainer.save_checkpoint(periodic_metrics, is_best=False)
+                    logger.info(f"Periodic checkpoint saved at epoch {epoch + 1}")
+                # Save checkpoint
+                trainer.save_checkpoint(val_metrics, is_best)
+                
+                # Early stopping check
+                if early_stopping(val_metrics, trainer.model):
+                    logger.info(f"Early stopping triggered at epoch {epoch+1}")
+                    logger.info(f"Best validation F1: {best_f1:.4f}")
+                    early_stopping.load_best_weights(trainer.model)
+                    break
+                    
+            except Exception as e:
+                logger.error(f"Error in epoch {epoch}: {e}", exc_info=True)
+                # Save emergency checkpoint
+                emergency_metrics = {"epoch": epoch, "emergency": True, "error": str(e)}
+                trainer.save_checkpoint(emergency_metrics, is_best=False)
+                raise
         
-        # Final evaluation on test set
-        logger.info("Final evaluation on test set...")
-        test_loss, test_metrics, test_labels, test_preds, test_scores = trainer.validate(test_loader)
-        
-        logger.info("=" * 50)
-        logger.info("FINAL RESULTS")
-        logger.info("=" * 50)
-        logger.info(f"Best Validation F1: {best_f1:.4f}")
-        logger.info(f"Test Metrics: {test_metrics}")
-        
-        # Generate comprehensive evaluation report
-        generate_evaluation_report(
-            test_labels, test_preds, test_scores, 
-            class_names, config, trainer.training_history
-        )
-        
-        # Save final model for production
-        save_production_model(trainer.model, config, trainer.best_metrics)
-        
+        # Training completed successfully
         logger.info("Training completed successfully!")
         
+        # Final evaluation on test set
+        logger.info("Starting final evaluation on test set...")
+        test_loss, test_metrics, test_labels, test_preds, test_scores = trainer.validate(test_loader)
+        
+        # Print final results
+        logger.info("=" * 60)
+        logger.info("FINAL RESULTS")
+        logger.info("=" * 60)
+        logger.info(f"Best Validation F1: {best_f1:.4f}")
+        logger.info(f"Test Loss: {test_loss:.4f}")
+        logger.info(f"Test Accuracy: {test_metrics.get('accuracy', 0):.4f}")
+        logger.info(f"Test F1: {test_metrics.get('f1', 0):.4f}")
+        logger.info(f"Test AUC: {test_metrics.get('auc', 0):.4f}")
+        logger.info(f"Test Precision: {test_metrics.get('precision', 0):.4f}")
+        logger.info(f"Test Recall: {test_metrics.get('recall', 0):.4f}")
+        logger.info("=" * 60)
+        
+        # Generate comprehensive evaluation report
+        logger.info("Generating evaluation report...")
+        try:
+            generate_evaluation_report(
+                test_labels, test_preds, test_scores, 
+                class_names, config, trainer.training_history
+            )
+            logger.info("Evaluation report generated successfully")
+        except Exception as e:
+            logger.warning(f"Failed to generate evaluation report: {e}")
+        
+        # Save final production model
+        logger.info("Saving production model...")
+        try:
+            save_production_model(trainer.model, config, trainer.best_metrics)
+            logger.info("Production model saved successfully")
+        except Exception as e:
+            logger.warning(f"⚠️  Failed to save production model: {e}")
+        
+        logger.info("All training tasks completed successfully!")
+        
     except KeyboardInterrupt:
-        logger.info("Training interrupted by user")
+        logger.info("Training interrupted by user (Ctrl+C)")
+        if trainer:
+            logger.info("💾 Saving current state...")
+            try:
+                emergency_metrics = {"epoch": trainer.current_epoch, "interrupted": True}
+                trainer.save_checkpoint(emergency_metrics, is_best=False)
+                logger.info("Emergency checkpoint saved")
+            except Exception as e:
+                logger.error(f"Failed to save emergency checkpoint: {e}")
+        
     except Exception as e:
-        logger.error(f"Training failed: {str(e)}")
-        raise
+        logger.error(f"Training failed with error: {str(e)}", exc_info=True)
+        
+        # Try to save emergency state
+        if trainer:
+            try:
+                emergency_metrics = {
+                    "epoch": getattr(trainer, 'current_epoch', 0), 
+                    "error": str(e),
+                    "emergency": True
+                }
+                trainer.save_checkpoint(emergency_metrics, is_best=False)
+                logger.info("Emergency checkpoint saved despite error")
+            except Exception as save_error:
+                logger.error(f"Failed to save emergency checkpoint: {save_error}")
+        
+        raise  # Re-raise the original exception
+        
     finally:
-        # Cleanup monitoring
-        if 'trainer' in locals():
-            trainer.cleanup_monitoring()
+        # Cleanup monitoring resources
+        logger.info("🧹 Cleaning up resources...")
+        if trainer:
+            try:
+                trainer.cleanup_monitoring()
+                logger.info("Monitoring resources cleaned up")
+            except Exception as e:
+                logger.error(f"Error during cleanup: {e}")
+        
+        logger.info("👋 Training session ended")
+
 
 if __name__ == "__main__":
     main()

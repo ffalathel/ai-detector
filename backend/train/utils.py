@@ -1,7 +1,7 @@
 """
 Utility functions for deepfake detection training
 """
-
+import tempfile
 import os
 import random
 import logging
@@ -47,7 +47,7 @@ def save_checkpoint(
     is_best: bool = False,
     logger: Optional[logging.Logger] = None
 ):
-    """Save model checkpoint."""
+    """Save model checkpoint with atomic write."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
@@ -63,76 +63,124 @@ def save_checkpoint(
         checkpoint['scheduler_state_dict'] = scheduler.state_dict()
     if scaler is not None:
         checkpoint['scaler_state_dict'] = scaler.state_dict()
+
+    def atomic_save(obj, filepath):
+        """Atomic save to prevent corruption"""
+        filepath = Path(filepath)
+        with tempfile.NamedTemporaryFile(dir=filepath.parent, delete=False, suffix='.tmp') as tmp:
+            torch.save(obj, tmp.name)
+            temp_path = tmp.name
+        os.replace(temp_path, filepath)
     
     # Save regular checkpoint
     checkpoint_path = output_dir / f'checkpoint_epoch_{epoch}.pt'
-    torch.save(checkpoint, checkpoint_path)
-    
-    # Save best model
-    if is_best:
-        best_path = output_dir / 'best_model.pt'
-        torch.save(checkpoint, best_path)
-        if logger:
-            logger.info(f"Best model saved at epoch {epoch} to {best_path}")
+    atomic_save(checkpoint, checkpoint_path)
     
     if logger:
         logger.info(f"Checkpoint saved at epoch {epoch} to {checkpoint_path}")
 
+    # Save best model
+    if is_best:
+        best_path = output_dir / 'best_model.pt'
+        atomic_save(checkpoint, best_path)
+        if logger:
+            logger.info(f"Best model saved at epoch {epoch} to {best_path}")
+    
+    
 def load_checkpoint(
+    checkpoint_path: str,
     model: torch.nn.Module,
-    optimizer: Optional[torch.optim.Optimizer],
-    filepath: str,
+    optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
     scaler: Optional[torch.cuda.amp.GradScaler] = None,
-    device: Optional[torch.device] = None
+    logger: Optional[logging.Logger] = None,
+    map_location: Optional[str] = None
 ) -> Tuple[int, Dict[str, float]]:
     """Load checkpoint and return last epoch and metrics."""
-    if not os.path.isfile(filepath):
-        raise FileNotFoundError(f"No checkpoint found at {filepath}")
+    checkpoint_path = Path(checkpoint_path)
     
-    checkpoint = torch.load(filepath, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        
+    checkpoint = torch.load(checkpoint_path, map_location=map_location or "cpu", weights_only=False)
     
-    if optimizer and 'optimizer_state_dict' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    if scheduler and 'scheduler_state_dict' in checkpoint:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    if scaler and 'scaler_state_dict' in checkpoint:
-        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+    # Load model weights
+    model.load_state_dict(checkpoint["model_state_dict"])
     
-    logger.info(f"Checkpoint loaded from {filepath} (epoch {checkpoint['epoch']})")
-    return checkpoint['epoch'], checkpoint.get('metrics', {})
+    # Optionally restore optimizer
+    if optimizer and "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    
+    # Optionally restore scheduler
+    if scheduler and "scheduler_state_dict" in checkpoint:
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    
+    # Optionally restore AMP scaler
+    if scaler and "scaler_state_dict" in checkpoint:
+        scaler.load_state_dict(checkpoint["scaler_state_dict"])
+    
+    epoch = checkpoint.get("epoch", 0)
+    metrics = checkpoint.get("metrics", {})
+    
+    if logger:
+        logger.info(f"Loaded checkpoint from {checkpoint_path} (epoch {epoch})")
+    
+    return epoch, metrics
 
-def calculate_metrics(
-    outputs: torch.Tensor, targets: torch.Tensor, threshold: float = 0.5
-) -> Dict[str, float]:
+def calculate_metrics(outputs: torch.Tensor, targets: torch.Tensor, threshold: float = 0.5) -> Dict[str, float]:
     """Calculate comprehensive metrics from model outputs and true labels."""
-    # Convert to numpy
-    probs = torch.sigmoid(outputs).cpu().numpy().flatten()
-    preds = (probs > threshold).astype(int)
-    targets_np = targets.cpu().numpy().flatten().astype(int)
-    
-    # Basic metrics
-    metrics = {
-        'accuracy': accuracy_score(targets_np, preds),
-        'precision': precision_score(targets_np, preds, zero_division=0),
-        'recall': recall_score(targets_np, preds, zero_division=0),
-        'f1': f1_score(targets_np, preds, zero_division=0),
-    }
-    
-    # AUC metrics (only if we have both classes)
-    if len(np.unique(targets_np)) > 1:
-        fpr, tpr, _ = roc_curve(targets_np, probs)
-        metrics['auc'] = auc(fpr, tpr)
-        metrics['avg_precision'] = average_precision_score(targets_np, probs)
+    metrics: Dict[str, float] = {}
+
+    outputs = outputs.detach()
+    targets = targets.detach()
+
+    # Normalize shapes
+    if outputs.dim() == 2 and outputs.shape[1] > 1:
+        # Multi-class logits: use softmax -> predicted class by argmax
+        probs = torch.softmax(outputs, dim=1).cpu().numpy()
+        preds = np.argmax(probs, axis=1)
+        targets_np = targets.cpu().numpy().flatten().astype(int)
+        # Basic metrics (use macro averages for multi-class)
+        metrics['accuracy'] = float(accuracy_score(targets_np, preds))
+        metrics['precision_macro'] = float(precision_score(targets_np, preds, average='macro', zero_division=0))
+        metrics['recall_macro'] = float(recall_score(targets_np, preds, average='macro', zero_division=0))
+        metrics['f1_macro'] = float(f1_score(targets_np, preds, average='macro', zero_division=0))
+        # Multi-class AUC using One-vs-Rest if possible
+        try:
+            from sklearn.metrics import roc_auc_score
+            # roc_auc_score expects shape (n_samples, n_classes) for probs
+            metrics['roc_auc_ovr'] = float(roc_auc_score(targets_np, probs, multi_class='ovr'))
+        except Exception:
+            metrics['roc_auc_ovr'] = 0.0
     else:
-        metrics['auc'] = 0.0
-        metrics['avg_precision'] = 0.0
-    
+        # Binary / single-output case: ensure 1D probs
+        probs = torch.sigmoid(outputs).cpu().numpy().flatten()
+        preds = (probs > threshold).astype(int)
+        targets_np = targets.cpu().numpy().flatten().astype(int)
+
+        metrics['accuracy'] = float(accuracy_score(targets_np, preds))
+        metrics['precision'] = float(precision_score(targets_np, preds, zero_division=0))
+        metrics['recall'] = float(recall_score(targets_np, preds, zero_division=0))
+        metrics['f1'] = float(f1_score(targets_np, preds, zero_division=0))
+
+        # AUC and avg precision only valid when both classes present
+        if len(np.unique(targets_np)) > 1:
+            try:
+                fpr, tpr, _ = roc_curve(targets_np, probs)
+                metrics['auc'] = float(auc(fpr, tpr))
+                metrics['avg_precision'] = float(average_precision_score(targets_np, probs))
+            except Exception as e:
+                logger.warning(f"AUC calculation failed: {e}")
+                metrics['auc'] = 0.5
+                metrics['avg_precision'] = 0.5
+        else:
+            metrics['auc'] = 0.5
+            metrics['avg_precision'] = float(np.mean(targets_np) if len(targets_np) > 0 else 0.5)
+
     return metrics
 
 class EarlyStopping:
-    """Early stopping with model checkpointing."""
+    """Early stopping with model checkpointing and device consistency."""
     def __init__(self, patience: int = 15, min_delta: float = 1e-4, metric: str = 'f1', mode: str = 'max'):
         self.patience = patience
         self.min_delta = min_delta
@@ -141,11 +189,16 @@ class EarlyStopping:
         self.best_score = None
         self.counter = 0
         self.best_weights = None
+        self.device = None  # Track device for consistency
 
     def __call__(self, metrics: Dict[str, float], model: torch.nn.Module) -> bool:
         score = metrics.get(self.metric)
         if score is None:
             raise ValueError(f"Metric '{self.metric}' not found in metrics")
+        
+        # Store device on first call
+        if self.device is None:
+            self.device = next(model.parameters()).device
         
         if self.best_score is None:
             self.best_score = score
@@ -166,13 +219,19 @@ class EarlyStopping:
             return score < self.best_score - self.min_delta
     
     def save_checkpoint(self, model: torch.nn.Module):
-        """Save best model weights."""
+        """Save best model weights to CPU for device independence."""
         self.best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
     
     def load_best_weights(self, model: torch.nn.Module):
-        """Load best model weights."""
+        """Load best model weights with proper device handling."""
         if self.best_weights:
-            model.load_state_dict(self.best_weights)
+            # Get current model device
+            current_device = next(model.parameters()).device
+            # Move weights to correct device
+            device_weights = {k: v.to(current_device) for k, v in self.best_weights.items()}
+            model.load_state_dict(device_weights)
+            logger.info("Loaded best weights from early stopping")
+
 
 def clip_gradients(model: torch.nn.Module, max_norm: float = 1.0, norm_type: float = 2.0):
     """Clip gradients to avoid exploding gradients."""
@@ -230,66 +289,112 @@ class WarmupScheduler:
 def train_one_epoch(
     model: torch.nn.Module,
     dataloader: torch.utils.data.DataLoader,
-    optimizer: torch.optim.Optimizer,
     device: torch.device,
     criterion: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
     scaler: Optional[torch.cuda.amp.GradScaler] = None,
     clip_grad: Optional[float] = None,
-    warmup_scheduler: Optional[WarmupScheduler] = None,
-    current_epoch: int = 0
-) -> Tuple[float, Dict[str, float]]:
-    """Run one training epoch."""
+    warmup_scheduler: Optional['WarmupScheduler'] = None,
+    current_epoch: int = 0,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+    accumulation_steps: int = 1,  # NEW: Add gradient accumulation
+) -> Tuple[float, Dict[str, float], List[int], List[int], List[float]]:
+    """Run one training epoch with proper mixed precision and gradient clipping."""
     model.train()
     running_loss = 0.0
-    all_outputs = []
+    all_logits = []
     all_targets = []
-
-    pbar = tqdm(dataloader, desc=f"Epoch {current_epoch+1} Training")
+    all_probs = []
+    all_preds = []
     
-    for batch_idx, (inputs, targets) in enumerate(pbar):
-        inputs = inputs.to(device)
-        targets = targets.to(device).float().unsqueeze(1)  # Ensure shape (B,1)
+    # FIX: Add gradient accumulation counter
+    optimizer.zero_grad()
+    accumulation_counter = 0
 
-        # Warmup learning rate
-        if warmup_scheduler and current_epoch < warmup_scheduler.warmup_epochs:
-            warmup_scheduler.step(current_epoch + batch_idx / len(dataloader))
+    # Apply warmup if needed
+    if warmup_scheduler and current_epoch < getattr(warmup_scheduler, 'warmup_epochs', 0):
+        warmup_scheduler.step(current_epoch)
 
-        optimizer.zero_grad()
+    for inputs, targets in tqdm(dataloader, desc="Training"):
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True).float().unsqueeze(1)
 
-        if scaler:
+        # Mixed precision forward pass
+        if scaler is not None:
             with torch.cuda.amp.autocast():
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
+                logits = model(inputs)
+                loss = criterion(logits, targets) / accumulation_steps  # Scale loss
+            
+            # Backward pass with scaling
             scaler.scale(loss).backward()
-            if clip_grad:
-                scaler.unscale_(optimizer)
-                clip_gradients(model, clip_grad)
-            scaler.step(optimizer)
-            scaler.update()
         else:
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            # Standard training
+            logits = model(inputs)
+            loss = criterion(logits, targets) / accumulation_steps  # Scale loss
             loss.backward()
-            if clip_grad:
-                clip_gradients(model, clip_grad)
-            optimizer.step()
-
-        running_loss += loss.item()
-        all_outputs.append(outputs.detach())
-        all_targets.append(targets.detach())
         
-        # Update progress bar
-        pbar.set_postfix({
-            'loss': loss.item(),
-            'lr': optimizer.param_groups[0]['lr']
-        })
+        # FIX: Gradient accumulation logic
+        accumulation_counter += 1
+        if accumulation_counter % accumulation_steps == 0:
+            # Gradient clipping
+            if clip_grad is not None:
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+            
+            # Optimizer step
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            
+            optimizer.zero_grad()
 
-    avg_loss = running_loss / len(dataloader)
-    all_outputs = torch.cat(all_outputs)
-    all_targets = torch.cat(all_targets)
-    metrics = calculate_metrics(all_outputs, all_targets)
+        # Update running loss (multiply by accumulation_steps to get correct total)
+        running_loss += loss.item() * inputs.size(0) * accumulation_steps
 
-    return avg_loss, metrics
+        # Predictions
+        with torch.no_grad():
+            probs = torch.sigmoid(logits).detach().cpu().numpy().flatten()
+            preds = (probs > 0.5).astype(int)
+            targets_np = targets.cpu().numpy().flatten().astype(int)
+
+            all_logits.extend(logits.detach().cpu().numpy().flatten())
+            all_targets.extend(targets_np.tolist())
+            all_probs.extend(probs.tolist())
+            all_preds.extend(preds.tolist())
+
+    # Average loss over dataset
+    avg_loss = running_loss / len(dataloader.dataset)
+
+    # Calculate metrics
+    targets_np = np.array(all_targets)
+    preds_np = np.array(all_preds)
+    probs_np = np.array(all_probs)
+
+    metrics = {
+        "accuracy": accuracy_score(targets_np, preds_np),
+        "precision": precision_score(targets_np, preds_np, zero_division=0),
+        "recall": recall_score(targets_np, preds_np, zero_division=0),
+        "f1": f1_score(targets_np, preds_np, zero_division=0),
+    }
+
+    # AUC calculation with safety checks
+    if len(np.unique(targets_np)) > 1 and len(probs_np) > 1:
+        try:
+            fpr, tpr, _ = roc_curve(targets_np, probs_np)
+            metrics["auc"] = auc(fpr, tpr)
+            metrics["avg_precision"] = average_precision_score(targets_np, probs_np)
+        except Exception as e:
+            logger.warning(f"AUC calculation failed: {e}")
+            metrics["auc"] = 0.5
+            metrics["avg_precision"] = 0.5
+    else:
+        metrics["auc"] = 0.5
+        metrics["avg_precision"] = np.mean(targets_np) if len(targets_np) > 0 else 0.5
+
+    return avg_loss, metrics, all_targets, all_preds, all_probs
 
 def validate_one_epoch(
     model: torch.nn.Module,
@@ -300,31 +405,41 @@ def validate_one_epoch(
     """Run one validation epoch."""
     model.eval()
     running_loss = 0.0
-    all_outputs = []
-    all_targets = []
-    all_probs = []
+    total_samples = 0
+    all_logits = [] # Raw model outputs for threshold tuning
+    all_targets = [] # Ground truth labels
+    all_probs = [] # Sigmoid probabilities
+    all_preds = [] # Binary predictions
 
     with torch.no_grad():
         for inputs, targets in tqdm(dataloader, desc="Validating"):
             inputs = inputs.to(device)
             targets = targets.to(device).float().unsqueeze(1)
-
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-
-            running_loss += loss.item()
-            probs = torch.sigmoid(outputs).cpu().numpy().flatten()
-            preds = (probs > 0.5).astype(int)
             
-            all_outputs.extend(preds)
-            all_targets.extend(targets.cpu().numpy().flatten().astype(int))
-            all_probs.extend(probs)
+            # Get raw logits
+            logits = model(inputs)
+            loss = criterion(logits, targets)
+            running_loss += loss.item() * inputs.size(0)
+            total_samples += inputs.size(0)
 
-    avg_loss = running_loss / len(dataloader)
+            # Calculate probabilities and predictions
+            probs = torch.sigmoid(logits).cpu().numpy().flatten()
+            preds = (probs > 0.5).astype(int)
+            targets_np = targets.cpu().numpy().flatten().astype(int)
+            
+            # Store all values
+            all_logits.extend(logits.cpu().numpy().flatten())
+            all_targets.extend(targets_np)
+            all_probs.extend(probs)
+            all_preds.extend(preds)
+
+
+    # FIX: Use total_samples instead of len(dataloader)
+    avg_loss = running_loss / total_samples
     
     # Calculate metrics using numpy arrays
     targets_np = np.array(all_targets)
-    preds_np = np.array(all_outputs)
+    preds_np = np.array(all_preds)
     probs_np = np.array(all_probs)
     
     metrics = {
@@ -335,15 +450,21 @@ def validate_one_epoch(
     }
     
     # AUC metrics
-    if len(np.unique(targets_np)) > 1:
-        fpr, tpr, _ = roc_curve(targets_np, probs_np)
-        metrics['auc'] = auc(fpr, tpr)
-        metrics['avg_precision'] = average_precision_score(targets_np, probs_np)
+    if len(np.unique(targets_np)) > 1 and len(probs_np) > 1:
+        try:
+            fpr, tpr, _ = roc_curve(targets_np, probs_np)
+            metrics['auc'] = auc(fpr, tpr)
+            metrics['avg_precision'] = average_precision_score(targets_np, probs_np)
+        except Exception as e:
+            logger.warning(f"AUC calculation failed: {e}")
+            metrics['auc'] = 0.5
+            metrics['avg_precision'] = 0.5
     else:
-        metrics['auc'] = 0.0
-        metrics['avg_precision'] = 0.0
+        metrics['auc'] = 0.5
+        metrics['avg_precision'] = np.mean(targets_np) if len(targets_np) > 0 else 0.5
 
-    return avg_loss, metrics, all_targets, all_outputs, all_probs
+
+    return avg_loss, metrics, all_targets, all_preds, all_probs
 
 def create_directory_structure(base_path: str):
     """Create necessary directory structure for the project."""
@@ -451,15 +572,101 @@ def validate_config(config) -> bool:
 
 def log_system_info():
     """Log system information."""
-    print("\n" + "="*50)
-    print("SYSTEM INFORMATION")
-    print("="*50)
-    print(f"PyTorch version: {torch.__version__}")
-    print(f"CUDA available: {torch.cuda.is_available()}")
+    logger.info("=" * 50)
+    logger.info("SYSTEM INFORMATION")
+    logger.info("=" * 50)
+    logger.info(f"PyTorch version: {torch.__version__}")
+    logger.info(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
-        print(f"CUDA version: {torch.version.cuda}")
-        print(f"GPU count: {torch.cuda.device_count()}")
-        for i in range(torch.cuda.device_count()):
-            print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-    print(f"CPU count: {os.cpu_count()}")
-    print("="*50 + "\n")
+        try:
+            logger.info(f"CUDA version: {torch.version.cuda}")
+            logger.info(f"GPU count: {torch.cuda.device_count()}")
+            for i in range(torch.cuda.device_count()):
+                logger.info(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+        except Exception as e:
+            logger.warning(f"Failed to query GPU details: {e}")
+    logger.info(f"CPU count: {os.cpu_count()}")
+    logger.info("=" * 50)
+
+class LearningRateFinder:
+    """Automatic learning rate finder using exponential increase and loss tracking."""
+    
+    def __init__(self, model, optimizer, criterion, device, min_lr=1e-7, max_lr=10, num_iter=100):
+        self.model = model
+        self.optimizer = optimizer
+        self.criterion = criterion
+        self.device = device
+        self.min_lr = min_lr
+        self.max_lr = max_lr
+        self.num_iter = num_iter
+        
+        # Store original learning rates
+        self.original_lrs = [group['lr'] for group in optimizer.param_groups]
+        
+    def find_lr(self, dataloader):
+        """Find optimal learning rate using exponential increase."""
+        self.model.train()
+        
+        # Calculate learning rate multiplier
+        lr_mult = (self.max_lr / self.min_lr) ** (1 / self.num_iter)
+        
+        # Set initial learning rate
+        for group in self.optimizer.param_groups:
+            group['lr'] = self.min_lr
+        
+        lr_history = []
+        loss_history = []
+        
+        # Create iterator for the dataloader
+        data_iter = iter(dataloader)
+        
+        for i in range(self.num_iter):
+            try:
+                inputs, targets = next(data_iter)
+            except StopIteration:
+                # Restart iterator if we run out of data
+                data_iter = iter(dataloader)
+                inputs, targets = next(data_iter)
+            
+            inputs = inputs.to(self.device)
+            targets = targets.to(self.device).float().unsqueeze(1)
+            
+            # Forward pass
+            self.optimizer.zero_grad()
+            outputs = self.model(inputs)
+            loss = self.criterion(outputs, targets)
+            
+            # Backward pass
+            loss.backward()
+            self.optimizer.step()
+            
+            # Record learning rate and loss
+            current_lr = self.optimizer.param_groups[0]['lr']
+            lr_history.append(current_lr)
+            loss_history.append(loss.item())
+            
+            # Increase learning rate exponentially
+            for group in self.optimizer.param_groups:
+                group['lr'] *= lr_mult
+            
+            # Stop if loss explodes
+            if len(loss_history) > 10 and loss_history[-1] > 4 * min(loss_history[-10:]):
+                logger.warning("Loss exploded, stopping learning rate finder")
+                break
+        
+        # Restore original learning rates
+        for group, original_lr in zip(self.optimizer.param_groups, self.original_lrs):
+            group['lr'] = original_lr
+        
+        # Find optimal learning rate (minimum loss)
+        min_loss_idx = np.argmin(loss_history)
+        optimal_lr = lr_history[min_loss_idx]
+        
+        logger.info(f"Optimal learning rate found: {optimal_lr:.2e}")
+        
+        return optimal_lr, lr_history, loss_history
+
+def find_optimal_learning_rate(model, optimizer, criterion, dataloader, device, **kwargs):
+    """Convenience function to find optimal learning rate."""
+    lr_finder = LearningRateFinder(model, optimizer, criterion, device, **kwargs)
+    return lr_finder.find_lr(dataloader)

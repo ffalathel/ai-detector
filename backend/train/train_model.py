@@ -975,8 +975,7 @@ def main():
     log_system_info()
     
     # Model serving mode - DISABLED to prevent conflicts with main app
-    if args.serve:
-        raise NotImplementedError("Server mode disabled. Use the main FastAPI app in app/main.py for serving")
+    # Server mode removed to prevent conflicts with main FastAPI app
     
     # Setup logging
     logger = setup_logging(config)

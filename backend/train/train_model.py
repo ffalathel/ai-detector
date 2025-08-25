@@ -87,6 +87,9 @@ except ImportError:
 FASTAPI_AVAILABLE = False
 print("Warning: FastAPI serving disabled in training mode to prevent conflicts with main app")
 
+# Metrics tracker
+from metrics_tracker import MetricsTracker
+
 # Configuration Management
 @dataclass
 class TrainingConfig:
@@ -996,6 +999,24 @@ def main():
         logger.info(f"Dataset: {len(train_loader.dataset)} train, {len(val_loader.dataset)} val, {len(test_loader.dataset)} test")
         logger.info(f"Classes: {class_names}")
         
+        # Initialize metrics tracker with context that affects accuracy
+        tracker_context = {
+            "model.backbone": config.backbone,
+            "model.dropout": config.dropout,
+            "training.batch_size": config.batch_size,
+            "training.learning_rate": config.learning_rate,
+            "training.weight_decay": config.weight_decay,
+            "training.epochs": config.epochs,
+            "data.train_ratio": config.train_ratio,
+            "data.val_ratio": config.val_ratio,
+            "data.num_workers": config.num_workers,
+            "data.pin_memory": config.pin_memory,
+            "seed": getattr(config, "seed", 42),
+            "dataset.class_names": class_names,
+            "dataset.class_counts": dict(class_counts),
+        }
+        metrics_tracker = MetricsTracker(output_dir=config.log_dir, context=tracker_context)
+        
         # Calculate class weights using the fixed extraction method
         def extract_labels_from_dataset(dataset):
             """Extract labels from any dataset type"""
@@ -1078,6 +1099,27 @@ def main():
                 # Logging metrics
                 trainer.log_metrics(train_loss, train_metrics['accuracy'], val_loss, val_metrics)
                 
+                # Track metrics with context for analysis
+                metrics_tracker.log_epoch(
+                    epoch_index=epoch,
+                    split="train",
+                    metrics={"loss": float(train_loss), "accuracy": float(train_metrics['accuracy'])},
+                    extra={"lr": float(trainer.optimizer.param_groups[0]['lr'])}
+                )
+                metrics_tracker.log_epoch(
+                    epoch_index=epoch,
+                    split="val",
+                    metrics={
+                        "loss": float(val_loss),
+                        "accuracy": float(val_metrics.get('accuracy', 0.0)),
+                        "f1": float(val_metrics.get('f1', 0.0)),
+                        "auc": float(val_metrics.get('auc', 0.0)),
+                        "precision": float(val_metrics.get('precision', 0.0)),
+                        "recall": float(val_metrics.get('recall', 0.0)),
+                    },
+                    extra={"lr": float(trainer.optimizer.param_groups[0]['lr'])}
+                )
+                
                 # Checkpoint saving
                 is_best = val_metrics['f1'] > best_f1
                 if is_best:
@@ -1117,6 +1159,20 @@ def main():
         # Final evaluation on test set
         logger.info("Starting final evaluation on test set...")
         test_loss, test_metrics, test_labels, test_preds, test_scores = trainer.validate(test_loader)
+        
+        # Log final test metrics
+        metrics_tracker.log_epoch(
+            epoch_index=trainer.current_epoch,
+            split="test",
+            metrics={
+                "loss": float(test_loss),
+                "accuracy": float(test_metrics.get('accuracy', 0.0)),
+                "f1": float(test_metrics.get('f1', 0.0)),
+                "auc": float(test_metrics.get('auc', 0.0)),
+                "precision": float(test_metrics.get('precision', 0.0)),
+                "recall": float(test_metrics.get('recall', 0.0)),
+            }
+        )
         
         # Print final results
         logger.info("=" * 60)

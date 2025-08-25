@@ -83,7 +83,7 @@ except ImportError:
     PLOTTING_AVAILABLE = False
     print("Warning: matplotlib/seaborn not available. Plotting disabled.")
 
-# Model Serving and API (optional) - DISABLED to prevent conflicts
+# Model Serving and API (optional) - DISABLED to prevent conflicts with main app
 FASTAPI_AVAILABLE = False
 print("Warning: FastAPI serving disabled in training mode to prevent conflicts with main app")
 
@@ -251,7 +251,29 @@ def extract_labels_from_dataloader(loader: DataLoader) -> List[int]:
         for _, y in loader.dataset:
             labels.append(int(y))
         return labels
+
+# Top-level dataset wrapper to ensure picklability when using multiple workers
+class TransformDataset(torch.utils.data.Dataset):
+    def __init__(self, base_dataset, indices, transform):
+        self.base_dataset = base_dataset
+        self.indices = indices
+        self.transform = transform
+        self.samples = [self.base_dataset.samples[i] for i in indices]
     
+    def __getitem__(self, idx):
+        img_path, label = self.base_dataset.samples[self.indices[idx]]
+        try:
+            img = Image.open(img_path).convert('RGB')
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Error loading image {img_path}: {e}")
+            img = Image.new('RGB', (224, 224), (0, 0, 0))
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+    
+    def __len__(self):
+        return len(self.indices)
+
 # Advanced Data Pipeline
 class DataPipeline:
     def __init__(self, config: TrainingConfig):
@@ -315,18 +337,15 @@ class DataPipeline:
         corrupted_count = 0
         for img_path, label in base_dataset.samples:
             try:
-            # Test if image can be opened and converted
+                # Test if image can be opened and converted
                 with Image.open(img_path) as img:
                     img.verify()  # Verify image integrity
-                
-                # Test conversion to RGB
                 with Image.open(img_path) as img:
                     img.convert('RGB')
-                
                 valid_samples.append((img_path, label))
             except Exception as e:
                 corrupted_count += 1
-                if corrupted_count <= 10:  # Log first 10 corrupted images
+                if corrupted_count <= 10:
                     logging.getLogger(__name__).warning(f"Corrupted image {img_path}: {e}")
                 elif corrupted_count == 11:
                     logging.getLogger(__name__).warning("Additional corrupted images will not be logged individually")
@@ -343,31 +362,7 @@ class DataPipeline:
         # Stratified split
         train_indices, val_indices, test_indices = self._stratified_split(base_dataset)
         
-        # Create custom dataset class to handle transforms properly
-        class TransformDataset(torch.utils.data.Dataset):
-            def __init__(self, base_dataset, indices, transform):
-                self.base_dataset = base_dataset
-                self.indices = indices
-                self.transform = transform
-                self.samples = [self.base_dataset.samples[i] for i in indices]
-            
-            def __getitem__(self, idx):
-                img_path, label = self.base_dataset.samples[self.indices[idx]]
-                try:
-                    img = Image.open(img_path).convert('RGB')
-                except Exception as e:
-                    logging.getLogger(__name__).error(f"Error loading image {img_path}: {e}")
-                    # Return a blank image as fallback
-                    img = Image.new('RGB', (224, 224), (0, 0, 0))
-        
-                if self.transform:
-                    img = self.transform(img)
-                return img, label
-            
-            def __len__(self):
-                return len(self.indices)
-        
-        # Create properly isolated datasets
+        # Use top-level TransformDataset (picklable) instead of nested class
         train_dataset = TransformDataset(base_dataset, train_indices, self.train_transform)
         val_dataset = TransformDataset(base_dataset, val_indices, self.val_transform)
         test_dataset = TransformDataset(base_dataset, test_indices, self.val_transform)

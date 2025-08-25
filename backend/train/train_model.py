@@ -993,24 +993,6 @@ def main():
         logger.info(f"Dataset: {len(train_loader.dataset)} train, {len(val_loader.dataset)} val, {len(test_loader.dataset)} test")
         logger.info(f"Classes: {class_names}")
         
-        # Initialize metrics tracker with context that affects accuracy
-        tracker_context = {
-            "model.backbone": config.backbone,
-            "model.dropout": config.dropout,
-            "training.batch_size": config.batch_size,
-            "training.learning_rate": config.learning_rate,
-            "training.weight_decay": config.weight_decay,
-            "training.epochs": config.epochs,
-            "data.train_ratio": config.train_ratio,
-            "data.val_ratio": config.val_ratio,
-            "data.num_workers": config.num_workers,
-            "data.pin_memory": config.pin_memory,
-            "seed": getattr(config, "seed", 42),
-            "dataset.class_names": class_names,
-            "dataset.class_counts": dict(class_counts),
-        }
-        metrics_tracker = MetricsTracker(output_dir=config.log_dir, context=tracker_context)
-        
         # Calculate class weights using the fixed extraction method
         def extract_labels_from_dataset(dataset):
             """Extract labels from any dataset type"""
@@ -1038,6 +1020,24 @@ def main():
         
         logger.info(f"Class distribution: {dict(class_counts)}")
         logger.info(f"Class weights: {class_weights.tolist()}")
+        
+        # Initialize metrics tracker with context that affects accuracy
+        tracker_context = {
+            "model.backbone": config.backbone,
+            "model.dropout": config.dropout,
+            "training.batch_size": config.batch_size,
+            "training.learning_rate": config.learning_rate,
+            "training.weight_decay": config.weight_decay,
+            "training.epochs": config.epochs,
+            "data.train_ratio": config.train_ratio,
+            "data.val_ratio": config.val_ratio,
+            "data.num_workers": config.num_workers,
+            "data.pin_memory": config.pin_memory,
+            "seed": getattr(config, "seed", 42),
+            "dataset.class_names": class_names,
+            "dataset.class_counts": dict(class_counts),
+        }
+        metrics_tracker = MetricsTracker(output_dir=config.log_dir, context=tracker_context)
         
         # Initialize training manager
         logger.info("Initializing training manager...")
